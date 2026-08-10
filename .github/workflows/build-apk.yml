@@ -1,0 +1,533 @@
+name: "ArbiCore Private - Build Latest ZIP APK [WF-03]"
+run-name: "ArbiCore WF-03 • ${{ github.event_name }} • run #${{ github.run_number }}"
+
+# WF-03 / 3.0.0
+# AUTO: runs when any ZIP is pushed on any branch (root or nested folder).
+# MANUAL: can also be run from Actions and optionally target a specific ZIP.
+on:
+  push:
+    paths:
+      - "*.zip"
+      - "**/*.zip"
+  workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "Optional ZIP path. Leave empty to build the latest valid Flutter ZIP."
+        required: false
+        type: string
+      backend_url:
+        description: "Optional backend URL. Repository Variable ARBICORE_BACKEND_URL is used when empty."
+        required: false
+        type: string
+  repository_dispatch:
+    types:
+      - arbicore_build_latest_zip
+
+concurrency:
+  group: arbicore-private-apk-${{ github.repository }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build-apk:
+    name: "Build APK [WF-03]"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      CI: "true"
+      WORKFLOW_VERSION: "3.0.0"
+      FLUTTER_VERSION: "3.32.8"
+      JAVA_VERSION: "17"
+      LOG_DIR: "${{ github.workspace }}/.ci_logs"
+
+    steps:
+      - name: "01 - Checkout repository"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "02 - Prepare diagnostics directory"
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$LOG_DIR"
+          mkdir -p "$LOG_DIR"
+          {
+            echo "workflow_version=$WORKFLOW_VERSION"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "ref=${GITHUB_REF}"
+            echo "sha=${GITHUB_SHA}"
+          } > "$LOG_DIR/00_workflow.txt"
+
+      - name: "03 - Select latest valid Flutter ZIP"
+        id: source
+        shell: bash
+        env:
+          REQUESTED_ZIP: ${{ inputs.source_zip }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          requested="${REQUESTED_ZIP:-}"
+          selected=""
+
+          is_flutter_zip() {
+            local zip_file="$1"
+            [[ -f "$zip_file" ]] || return 1
+            unzip -tq "$zip_file" >/dev/null 2>&1 || return 1
+            unzip -Z1 "$zip_file" | grep -Eq '(^|/)pubspec\.yaml$' || return 1
+            unzip -Z1 "$zip_file" | grep -Eq '(^|/)lib/main\.dart$' || return 1
+          }
+
+          choose_newest_from_list() {
+            local best_ts=-1
+            local best_file=""
+            local file rel ts
+
+            while IFS= read -r file; do
+              [[ -n "$file" ]] || continue
+              [[ "$file" == *.zip || "$file" == *.ZIP ]] || continue
+              [[ -f "$file" ]] || continue
+              if ! is_flutter_zip "$file"; then
+                continue
+              fi
+
+              rel="${file#./}"
+              ts="$(git log -1 --format=%ct -- "$rel" 2>/dev/null || true)"
+              [[ -n "$ts" ]] || ts="$(stat -c %Y "$file" 2>/dev/null || echo 0)"
+
+              if (( ts > best_ts )); then
+                best_ts="$ts"
+                best_file="$file"
+              fi
+            done
+
+            printf '%s' "$best_file"
+          }
+
+          if [[ -n "$requested" ]]; then
+            requested="${requested#./}"
+            if ! is_flutter_zip "$requested"; then
+              echo "::error::Requested ZIP is missing, corrupt, or not a Flutter source ZIP: $requested"
+              exit 1
+            fi
+            selected="$requested"
+          else
+            # On a push, prefer a valid ZIP changed by THIS push.
+            if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+              changed_file_list="$RUNNER_TEMP/arbicore_changed_files.txt"
+              : > "$changed_file_list"
+
+              if [[ -n "${BEFORE_SHA:-}" && ! "$BEFORE_SHA" =~ ^0+$ ]] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+                git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA" -- '*.zip' '*.ZIP' > "$changed_file_list" || true
+              else
+                git show --pretty='' --name-only "$GITHUB_SHA" -- '*.zip' '*.ZIP' > "$changed_file_list" || true
+              fi
+
+              selected="$(choose_newest_from_list < "$changed_file_list")"
+            fi
+
+            # Fallback for manual/dispatch runs or when the changed ZIP was not a Flutter app.
+            if [[ -z "$selected" ]]; then
+              all_zip_list="$RUNNER_TEMP/arbicore_all_zips.txt"
+              find . -type f \( -iname '*.zip' \) -not -path './.git/*' -printf '%P\n' > "$all_zip_list"
+              selected="$(choose_newest_from_list < "$all_zip_list")"
+            fi
+
+            if [[ -z "$selected" ]]; then
+              echo "::error::No valid Flutter ZIP was found. A valid ZIP must contain pubspec.yaml and lib/main.dart."
+              exit 1
+            fi
+          fi
+
+          selected="$(realpath "$selected")"
+          echo "Selected ZIP: $selected"
+          unzip -tq "$selected"
+
+          extract_dir="$RUNNER_TEMP/arbicore_source_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          unzip -q "$selected" -d "$extract_dir"
+
+          app_dir=""
+          shortest=999999
+          while IFS= read -r -d '' pubspec; do
+            dir="$(dirname "$pubspec")"
+            if [[ -f "$dir/lib/main.dart" ]]; then
+              len=${#dir}
+              if (( len < shortest )); then
+                shortest=$len
+                app_dir="$dir"
+              fi
+            fi
+          done < <(find "$extract_dir" -type f -name pubspec.yaml -print0)
+
+          if [[ -z "$app_dir" ]]; then
+            echo "::error::ZIP extracted successfully but Flutter app root was not found."
+            exit 1
+          fi
+
+          echo "source_zip=$selected" >> "$GITHUB_OUTPUT"
+          echo "app_dir=$app_dir" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "selected_zip=$selected"
+            echo "app_dir=$app_dir"
+          } | tee "$LOG_DIR/01_source_selection.log"
+
+      - name: "04 - Set up Java 17"
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: "05 - Set up pinned Flutter"
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: "06 - Record toolchain"
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            flutter --version
+            dart --version 2>&1
+            java -version 2>&1
+          } | tee "$LOG_DIR/02_toolchain.log"
+
+      - name: "07 - Bootstrap Android project if required"
+        shell: bash
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: |
+          set -euo pipefail
+
+          if [[ -f scripts/bootstrap_android.sh ]]; then
+            chmod +x scripts/bootstrap_android.sh
+            bash scripts/bootstrap_android.sh 2>&1 | tee "$LOG_DIR/03_bootstrap_android.log"
+          elif [[ -d android ]]; then
+            echo "android/ already exists; bootstrap skipped." | tee "$LOG_DIR/03_bootstrap_android.log"
+          else
+            echo "::error::No android/ directory and no scripts/bootstrap_android.sh found."
+            exit 1
+          fi
+
+      - name: "08 - Resolve dependencies with retry"
+        shell: bash
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: |
+          set -euo pipefail
+          : > "$LOG_DIR/04_pub_get.log"
+
+          final_status=1
+          for attempt in 1 2 3; do
+            echo "===== flutter pub get attempt $attempt/3 =====" | tee -a "$LOG_DIR/04_pub_get.log"
+            set +e
+            flutter pub get 2>&1 | tee -a "$LOG_DIR/04_pub_get.log"
+            final_status=${PIPESTATUS[0]}
+            set -e
+
+            if [[ $final_status -eq 0 ]]; then
+              break
+            fi
+            [[ $attempt -eq 3 ]] || sleep $((attempt * 8))
+          done
+
+          exit "$final_status"
+
+      - name: "09 - Analyze source (report only)"
+        continue-on-error: true
+        shell: bash
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: |
+          set -o pipefail
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee "$LOG_DIR/05_analyze.log"
+
+      - name: "10 - Run Flutter tests (report only)"
+        continue-on-error: true
+        shell: bash
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: |
+          set -o pipefail
+          if [[ -d test ]] && find test -type f -name '*_test.dart' -print -quit | grep -q .; then
+            flutter test 2>&1 | tee "$LOG_DIR/06_tests.log"
+          else
+            echo "No Flutter tests found; skipped." | tee "$LOG_DIR/06_tests.log"
+          fi
+
+      - name: "11 - Build release APK"
+        id: build
+        shell: bash
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        env:
+          INPUT_BACKEND_URL: ${{ inputs.backend_url }}
+          REPOSITORY_BACKEND_URL: ${{ vars.ARBICORE_BACKEND_URL }}
+          API_TOKEN: ${{ secrets.ARBICORE_API_TOKEN }}
+          REOWN_PROJECT_ID: ${{ secrets.REOWN_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          set +x
+
+          backend_url="${INPUT_BACKEND_URL:-}"
+          [[ -n "$backend_url" ]] || backend_url="${REPOSITORY_BACKEND_URL:-}"
+
+          dart_defines=()
+          if [[ -n "$backend_url" ]]; then
+            dart_defines+=("--dart-define=BACKEND_URL=$backend_url")
+          else
+            echo "::warning::ARBICORE_BACKEND_URL is not configured; source default BACKEND_URL will be used."
+          fi
+
+          if [[ -n "${API_TOKEN:-}" ]]; then
+            dart_defines+=("--dart-define=API_TOKEN=$API_TOKEN")
+          else
+            echo "::warning::ARBICORE_API_TOKEN is not configured."
+          fi
+
+          if [[ -n "${REOWN_PROJECT_ID:-}" ]]; then
+            dart_defines+=("--dart-define=REOWN_PROJECT_ID=$REOWN_PROJECT_ID")
+          else
+            echo "::warning::REOWN_PROJECT_ID is not configured; wallet connection may remain disabled."
+          fi
+
+          rm -rf build/app/outputs/flutter-apk
+          : > "$LOG_DIR/07_build_apk.log"
+
+          set +e
+          flutter build apk --release "${dart_defines[@]}" 2>&1 | tee "$LOG_DIR/07_build_apk.log"
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $status -ne 0 ]] && grep -Eqi \
+            'timed out|timeout|connection reset|connection refused|temporary failure|could not resolve|could not download|socketexception|http[^0-9]*(502|503|504)|remote host terminated' \
+            "$LOG_DIR/07_build_apk.log"; then
+            echo "Transient network/dependency error detected; one automatic retry will be attempted." | tee -a "$LOG_DIR/07_build_apk.log"
+            sleep 10
+
+            set +e
+            flutter pub get 2>&1 | tee -a "$LOG_DIR/07_build_apk.log"
+            pub_status=${PIPESTATUS[0]}
+            if [[ $pub_status -eq 0 ]]; then
+              flutter build apk --release "${dart_defines[@]}" 2>&1 | tee -a "$LOG_DIR/07_build_apk.log"
+              status=${PIPESTATUS[0]}
+            else
+              status=$pub_status
+            fi
+            set -e
+          fi
+
+          exit "$status"
+
+      - name: "12 - Verify and stage exactly one APK"
+        id: apk
+        shell: bash
+        working-directory: ${{ steps.source.outputs.app_dir }}
+        run: |
+          set -euo pipefail
+
+          apk="build/app/outputs/flutter-apk/app-release.apk"
+          if [[ ! -s "$apk" ]]; then
+            echo "::error::Release APK was not created: $apk"
+            find build/app/outputs -maxdepth 5 -type f -print 2>/dev/null || true
+            exit 1
+          fi
+
+          delivery="$GITHUB_WORKSPACE/delivery"
+          rm -rf "$delivery"
+          mkdir -p "$delivery"
+
+          final_apk="$delivery/ArbiCore-Private.apk"
+          cp "$apk" "$final_apk"
+
+          # APK is a ZIP container; validate that it is not truncated/corrupt.
+          unzip -tq "$final_apk" >/dev/null
+
+          apk_count="$(find "$delivery" -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')"
+          if [[ "$apk_count" != "1" ]]; then
+            echo "::error::Expected exactly one APK, found: $apk_count"
+            find "$delivery" -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+          sha="$(sha256sum "$final_apk" | awk '{print $1}')"
+          size="$(stat -c %s "$final_apk")"
+          echo "apk_path=$final_apk" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "size=$size" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### ArbiCore WF-03 build"
+            echo "- Source ZIP: \`${{ steps.source.outputs.source_zip }}\`"
+            echo "- Output: \`ArbiCore-Private.apk\`"
+            echo "- APK count: \`1\`"
+            echo "- Size: \`$size bytes\`"
+            echo "- SHA-256: \`$sha\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "13 - Upload only final APK"
+        id: upload_apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArbiCore-APK
+          path: ${{ steps.apk.outputs.apk_path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: "14 - Delete every previous ArbiCore artifact after successful APK upload"
+        if: success()
+        uses: actions/github-script@v7
+        env:
+          CURRENT_ARTIFACT_ID: ${{ steps.upload_apk.outputs.artifact-id }}
+        with:
+          script: |
+            const keepId = Number(process.env.CURRENT_ARTIFACT_ID || 0);
+            if (!keepId) {
+              core.warning('Current artifact ID is unavailable. Old artifacts were not deleted.');
+              return;
+            }
+
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              }
+            );
+
+            const old = artifacts.filter(a =>
+              a.id !== keepId && a.name.startsWith('ArbiCore-')
+            );
+
+            let failed = 0;
+            for (const artifact of old) {
+              try {
+                await github.rest.actions.deleteArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                });
+                core.info(`Deleted old artifact: ${artifact.name} (${artifact.id})`);
+              } catch (error) {
+                failed += 1;
+                core.warning(`Could not delete artifact ${artifact.id}: ${error.message}`);
+              }
+            }
+
+            if (failed === 0) {
+              core.info(`Cleanup complete. Kept only current ArbiCore artifact ${keepId}.`);
+            } else {
+              core.warning(`${failed} old artifact(s) could not be deleted; APK build itself remains successful.`);
+            }
+
+      - name: "90 - Collect failure diagnostics"
+        if: failure()
+        id: diagnostics
+        shell: bash
+        env:
+          API_TOKEN_TO_REDACT: ${{ secrets.ARBICORE_API_TOKEN }}
+          REOWN_ID_TO_REDACT: ${{ secrets.REOWN_PROJECT_ID }}
+        run: |
+          set +e
+
+          diag_root="$GITHUB_WORKSPACE/.diagnostics"
+          diag_dir="$diag_root/report"
+          diag_zip="$diag_root/ArbiCore-build-error-WF03-run-${GITHUB_RUN_NUMBER}-attempt-${GITHUB_RUN_ATTEMPT}.zip"
+          rm -rf "$diag_root"
+          mkdir -p "$diag_dir"
+
+          [[ -d "$LOG_DIR" ]] && cp -R "$LOG_DIR" "$diag_dir/logs"
+
+          {
+            echo "ArbiCore Private build diagnostics"
+            echo "workflow_version=$WORKFLOW_VERSION"
+            echo "utc=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "event=$GITHUB_EVENT_NAME"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_number=$GITHUB_RUN_NUMBER"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+            echo "ref=$GITHUB_REF"
+            echo "sha=$GITHUB_SHA"
+            echo "runner_os=$RUNNER_OS"
+            echo "runner_arch=$RUNNER_ARCH"
+            echo "source_zip=${{ steps.source.outputs.source_zip }}"
+            echo "app_dir=${{ steps.source.outputs.app_dir }}"
+          } > "$diag_dir/context.txt"
+
+          {
+            uname -a
+            echo
+            df -h
+            echo
+            free -h || true
+            echo
+            command -v flutter && flutter --version || true
+            echo
+            command -v dart && dart --version 2>&1 || true
+            echo
+            java -version 2>&1 || true
+            echo
+            git --version || true
+          } > "$diag_dir/system.txt" 2>&1
+
+          app_dir="${{ steps.source.outputs.app_dir }}"
+          if [[ -n "$app_dir" && -d "$app_dir" ]]; then
+            [[ -f "$app_dir/pubspec.yaml" ]] && cp "$app_dir/pubspec.yaml" "$diag_dir/pubspec.yaml"
+            [[ -f "$app_dir/pubspec.lock" ]] && cp "$app_dir/pubspec.lock" "$diag_dir/pubspec.lock"
+            [[ -f "$app_dir/android/gradle/wrapper/gradle-wrapper.properties" ]] && cp "$app_dir/android/gradle/wrapper/gradle-wrapper.properties" "$diag_dir/gradle-wrapper.properties"
+            [[ -f "$app_dir/android/settings.gradle" ]] && cp "$app_dir/android/settings.gradle" "$diag_dir/settings.gradle"
+            [[ -f "$app_dir/android/settings.gradle.kts" ]] && cp "$app_dir/android/settings.gradle.kts" "$diag_dir/settings.gradle.kts"
+            [[ -f "$app_dir/android/app/build.gradle" ]] && cp "$app_dir/android/app/build.gradle" "$diag_dir/app-build.gradle"
+            [[ -f "$app_dir/android/app/build.gradle.kts" ]] && cp "$app_dir/android/app/build.gradle.kts" "$diag_dir/app-build.gradle.kts"
+          fi
+
+          [[ -f "$HOME/.pub-cache/log/pub_log.txt" ]] && cp "$HOME/.pub-cache/log/pub_log.txt" "$diag_dir/pub_log.txt"
+
+          python3 - "$diag_dir" <<'PY'
+          import os
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          secrets = [
+              os.environ.get("API_TOKEN_TO_REDACT", ""),
+              os.environ.get("REOWN_ID_TO_REDACT", ""),
+          ]
+          secrets = [s for s in secrets if s]
+
+          if secrets:
+              for path in root.rglob("*"):
+                  if not path.is_file() or path.stat().st_size > 10_000_000:
+                      continue
+                  try:
+                      text = path.read_text(errors="ignore")
+                  except Exception:
+                      continue
+                  updated = text
+                  for secret in secrets:
+                      updated = updated.replace(secret, "***REDACTED***")
+                  if updated != text:
+                      path.write_text(updated)
+          PY
+
+          (cd "$diag_root" && zip -qr "$(basename "$diag_zip")" report)
+          echo "diag_zip=$diag_zip" >> "$GITHUB_OUTPUT"
+          echo "Diagnostics: $diag_zip"
+
+      - name: "91 - Upload error log package"
+        if: failure() && steps.diagnostics.outputs.diag_zip != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArbiCore-Build-Error-WF03-${{ github.run_number }}-Attempt-${{ github.run_attempt }}
+          path: ${{ steps.diagnostics.outputs.diag_zip }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
